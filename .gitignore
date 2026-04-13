@@ -3,6 +3,7 @@ videos.zip
 dataset/sim_dataset/videos/
 dataset/test_dataset/
 dataset/sim_dataset/video_annotations/
+videos/
 
 # ── Model checkpoints ─────────────────────────────────────────────────────────
 checkpoints/
