@@ -1,4 +1,5 @@
 import os
+import random
 import cv2
 import numpy as np
 import pandas as pd
@@ -6,6 +7,8 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from sklearn.model_selection import train_test_split
+
+from data_augmentation import build_train_transform
 
 COLLISION_TYPES = ['head-on', 'rear-end', 'sideswipe', 'single', 't-bone']
 TYPE_TO_IDX = {t: i for i, t in enumerate(COLLISION_TYPES)}
@@ -32,24 +35,29 @@ class AccidentDataset(Dataset):
     """
 
     def __init__(self, df: pd.DataFrame, video_root: str,
-                 num_frames: int = 16, transform=None):
+                 num_frames: int = 16, transform=None, aug_transform=None,
+                 aug_prob: float = 0.5):
         """
         Args:
-            df          : DataFrame with columns from labels.csv (already filtered/split).
-            video_root  : Root directory that prefixes the 'rgb_path' column values.
-            num_frames  : Number of frames to uniformly sample from each video.
-            transform   : Optional torchvision transform applied per frame.
-                          Falls back to DEFAULT_TRANSFORM (resize + ImageNet normalise).
+            df            : DataFrame with columns from labels.csv (already filtered/split).
+            video_root    : Root directory that prefixes the 'rgb_path' column values.
+            num_frames    : Number of frames to uniformly sample from each video.
+            transform     : Base transform applied per frame (no augmentation).
+            aug_transform : Augmented transform applied to the whole clip with probability aug_prob.
+            aug_prob      : Probability of applying aug_transform to a clip (default 0.5).
         """
         self.df = df.reset_index(drop=True)
         self.video_root = video_root
         self.num_frames = num_frames
         self.transform = transform or DEFAULT_TRANSFORM
+        self.aug_transform = aug_transform
+        self.aug_prob = aug_prob
 
     def __len__(self):
         return len(self.df)
 
-    def _sample_frames(self, video_path: str, total_frames: int) -> torch.Tensor:
+    def _sample_frames(self, video_path: str, total_frames: int,
+                       transform) -> torch.Tensor:
         """Load `num_frames` uniformly-spaced frames from *video_path*."""
         cap = cv2.VideoCapture(video_path)
         indices = np.linspace(0, total_frames - 1, self.num_frames, dtype=int)
@@ -61,7 +69,7 @@ class AccidentDataset(Dataset):
             ret, frame = cap.read()
             if ret:
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                last_valid = self.transform(frame)
+                last_valid = transform(frame)
             frames.append(last_valid)
 
         cap.release()
@@ -72,7 +80,13 @@ class AccidentDataset(Dataset):
         video_path = os.path.join(self.video_root, row["rgb_path"])
         total_frames = int(row["no_frames"])
 
-        frames = self._sample_frames(video_path, total_frames)
+        # Decide once per clip whether to augment
+        if self.aug_transform is not None and random.random() < self.aug_prob:
+            clip_transform = self.aug_transform
+        else:
+            clip_transform = self.transform
+
+        frames = self._sample_frames(video_path, total_frames, clip_transform)
 
         targets = {
             "accident_time": torch.tensor(
@@ -126,7 +140,7 @@ class TestDataset(Dataset):
         row = self.df.iloc[idx]
         video_path = os.path.join(self.video_root, row["path"])
         total_frames = int(row["no_frames"])
-        frames = self._sample_frames(video_path, total_frames)
+        frames = self._sample_frames(video_path, total_frames)  # no augmentation for test
         return frames, row["path"]
 
 
@@ -139,6 +153,7 @@ def get_dataloaders(
     num_workers: int = 4,
     seed: int = 42,
     transform=None,
+    augmentation: str | None = None,
     max_samples: int = None,
 ):
     """
@@ -158,8 +173,13 @@ def get_dataloaders(
         df, test_size=val_split, random_state=seed, stratify=df["type"]
     )
 
-    train_ds = AccidentDataset(train_df, video_root, num_frames, transform)
-    val_ds = AccidentDataset(val_df, video_root, num_frames, transform)
+    aug_transform = None if (transform or augmentation is None) else build_train_transform(augmentation)
+    base_transform = transform or DEFAULT_TRANSFORM
+
+    train_ds = AccidentDataset(train_df, video_root, num_frames,
+                               transform=base_transform, aug_transform=aug_transform)
+    val_ds = AccidentDataset(val_df, video_root, num_frames,
+                             transform=base_transform)
 
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
