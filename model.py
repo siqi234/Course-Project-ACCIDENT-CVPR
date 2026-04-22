@@ -17,6 +17,7 @@ Usage:
     python model.py --help   # see CLI options
 """
 
+import argparse
 import os
 
 import torch
@@ -156,29 +157,29 @@ class AccidentLoss(nn.Module):
 # Evaluation metrics
 # ---------------------------------------------------------------------------
 
-def temporal_accuracy(pred_time: torch.Tensor, gt_time: torch.Tensor,
-                      tolerance: float = 0.05) -> float:
-    """Fraction of predictions within `tolerance` of the ground-truth normalised frame."""
-    return (pred_time - gt_time).abs().le(tolerance).float().mean().item()
+def temporal_score(pred_time: torch.Tensor, gt_time: torch.Tensor,
+                   sigma: float = 0.1) -> float:
+    """Gaussian-style temporal similarity (T). Errors near 0 → score near 1."""
+    return torch.exp(-((pred_time - gt_time) ** 2) / (2 * sigma ** 2)).mean().item()
 
 
-def spatial_accuracy(pred_loc: torch.Tensor, gt_loc: torch.Tensor,
-                     threshold: float = 0.1) -> float:
-    """Fraction of predictions whose Euclidean distance to GT centre is below threshold."""
-    dist = (pred_loc - gt_loc).pow(2).sum(dim=-1).sqrt()
-    return dist.le(threshold).float().mean().item()
+def spatial_score(pred_loc: torch.Tensor, gt_loc: torch.Tensor,
+                  sigma: float = 0.1) -> float:
+    """Gaussian-style spatial similarity (S). Small distance → score near 1."""
+    dist_sq = (pred_loc - gt_loc).pow(2).sum(dim=-1)
+    return torch.exp(-dist_sq / (2 * sigma ** 2)).mean().item()
 
 
 def classification_accuracy(pred_type: torch.Tensor, gt_type: torch.Tensor) -> float:
-    """Fraction of correctly predicted collision types."""
+    """Top-1 classification accuracy (C)."""
     return pred_type.argmax(dim=-1).eq(gt_type).float().mean().item()
 
 
-def harmonic_score(t_acc: float, s_acc: float) -> float:
-    """Harmonic mean of temporal and spatial accuracy (competition metric)."""
-    if t_acc + s_acc == 0:
+def accident_score(t: float, s: float, c: float) -> float:
+    """Competition ACCIDENT score: harmonic mean of T, S, C."""
+    if min(t, s, c) == 0:
         return 0.0
-    return 2 * t_acc * s_acc / (t_acc + s_acc)
+    return 3 / (1 / t + 1 / s + 1 / c)
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +197,7 @@ def train_one_epoch(model, loader, criterion, optimiser, device, scaler, epoch):
         gt_type = targets["type"].to(device, non_blocking=True)
 
         optimiser.zero_grad()
-        with torch.amp.autocast(device_type=device.type):
+        with torch.amp.autocast(device_type=device.type, enabled=device.type == "cuda"):
             pred_time, pred_loc, pred_type = model(frames)
             loss, *_ = criterion(pred_time, pred_loc, pred_type,
                                  gt_time, gt_loc, gt_type)
@@ -217,7 +218,7 @@ def train_one_epoch(model, loader, criterion, optimiser, device, scaler, epoch):
 def evaluate(model, loader, criterion, device):
     model.eval()
     total_loss = 0.0
-    all_t_acc, all_s_acc, all_cls_acc = [], [], []
+    all_t, all_s, all_cls = [], [], []
 
     pbar = tqdm_bar(loader, desc="  Val        ", leave=False, unit="batch")
     for frames, targets in pbar:
@@ -231,98 +232,105 @@ def evaluate(model, loader, criterion, device):
                              gt_time, gt_loc, gt_type)
 
         total_loss += loss.item()
-        all_t_acc.append(temporal_accuracy(pred_time, gt_time))
-        all_s_acc.append(spatial_accuracy(pred_loc, gt_loc))
-        all_cls_acc.append(classification_accuracy(pred_type, gt_type))
+        all_t.append(temporal_score(pred_time, gt_time))
+        all_s.append(spatial_score(pred_loc, gt_loc))
+        all_cls.append(classification_accuracy(pred_type, gt_type))
         pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-    avg_t = sum(all_t_acc) / len(all_t_acc)
-    avg_s = sum(all_s_acc) / len(all_s_acc)
-    avg_cls = sum(all_cls_acc) / len(all_cls_acc)
-    return total_loss / len(loader), avg_t, avg_s, harmonic_score(avg_t, avg_s), avg_cls
+    avg_t   = sum(all_t)   / len(all_t)
+    avg_s   = sum(all_s)   / len(all_s)
+    avg_cls = sum(all_cls) / len(all_cls)
+    avg_acc = accident_score(avg_t, avg_s, avg_cls)
+    return total_loss / len(loader), avg_t, avg_s, avg_cls, avg_acc
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Config — edit here, then run directly
-# ---------------------------------------------------------------------------
-LABELS_CSV      = "dataset/sim_dataset/labels.csv"
-VIDEO_ROOT      = "dataset/sim_dataset"
-NUM_FRAMES      = 16
-BATCH_SIZE      = 8
-EPOCHS          = 30
-LR              = 1e-4
-HIDDEN_SIZE     = 512
-NUM_LSTM_LAYERS = 2
-DROPOUT         = 0.3
-VAL_SPLIT       = 0.2
-NUM_WORKERS     = 0        # 0 = no multiprocessing (required on Windows)
-SAVE_DIR        = "checkpoints"
-SEED            = 42
-AUGMENTATION    = "motion_blur"     # None | "motion_blur" | "resolution"
-MAX_SAMPLES     = None     # set e.g. 500 for a quick smoke-test
-# ---------------------------------------------------------------------------
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train baseline accident predictor")
+    parser.add_argument("--labels_csv", default="dataset/sim_dataset/labels.csv")
+    parser.add_argument("--video_root", default="dataset/sim_dataset")
+    parser.add_argument("--num_frames", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--hidden_size", type=int, default=512)
+    parser.add_argument("--num_lstm_layers", type=int, default=2)
+    parser.add_argument("--dropout", type=float, default=0.3)
+    parser.add_argument("--val_split", type=float, default=0.2)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--save_dir", default="checkpoints")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--max_samples", type=int, default=None,
+        help="Cap dataset size for a quick smoke-test (e.g. --max_samples 32)"
+    )
+    return parser.parse_args()
 
 
 def main():
-    torch.manual_seed(SEED)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    args = parse_args()
+
+    torch.manual_seed(args.seed)
+    device = torch.device(
+        "cuda" if torch.cuda.is_available()
+        else "mps" if torch.backends.mps.is_available()
+        else "cpu"
+    )
     print(f"Using device: {device}")
 
-    os.makedirs(SAVE_DIR, exist_ok=True)
+    os.makedirs(args.save_dir, exist_ok=True)
 
     # --- Data ---
     train_loader, val_loader = get_dataloaders(
-        labels_csv=LABELS_CSV,
-        video_root=VIDEO_ROOT,
-        num_frames=NUM_FRAMES,
-        batch_size=BATCH_SIZE,
-        val_split=VAL_SPLIT,
-        num_workers=NUM_WORKERS,
-        seed=SEED,
-        augmentation=AUGMENTATION,
-        max_samples=MAX_SAMPLES,
+        labels_csv=args.labels_csv,
+        video_root=args.video_root,
+        num_frames=args.num_frames,
+        batch_size=args.batch_size,
+        val_split=args.val_split,
+        num_workers=args.num_workers,
+        seed=args.seed,
+        max_samples=args.max_samples,
     )
     print(f"Train batches: {len(train_loader)} | Val batches: {len(val_loader)}")
 
     # --- Model ---
     model = AccidentPredictor(
-        hidden_size=HIDDEN_SIZE,
-        num_lstm_layers=NUM_LSTM_LAYERS,
-        dropout=DROPOUT,
+        hidden_size=args.hidden_size,
+        num_lstm_layers=args.num_lstm_layers,
+        dropout=args.dropout,
     ).to(device)
 
     criterion = AccidentLoss().to(device)
     optimiser = AdamW(
         [p for p in model.parameters() if p.requires_grad]
         + list(criterion.parameters()),
-        lr=LR,
+        lr=args.lr,
         weight_decay=1e-4,
     )
-    scheduler = CosineAnnealingLR(optimiser, T_max=EPOCHS, eta_min=1e-6)
-    scaler = torch.amp.GradScaler()
+    scheduler = CosineAnnealingLR(optimiser, T_max=args.epochs, eta_min=1e-6)
+    scaler = torch.amp.GradScaler(enabled=device.type == "cuda")
 
     # --- Training ---
     best_score = 0.0
-    epoch_pbar = tqdm_bar(range(1, EPOCHS + 1), desc="Epochs", unit="epoch")
+    epoch_pbar = tqdm_bar(range(1, args.epochs + 1), desc="Epochs", unit="epoch")
     for epoch in epoch_pbar:
         train_loss = train_one_epoch(model, train_loader, criterion, optimiser, device, scaler, epoch)
-        val_loss, t_acc, s_acc, score, cls_acc = evaluate(model, val_loader, criterion, device)
+        val_loss, t, s, c, acc = evaluate(model, val_loader, criterion, device)
         scheduler.step()
-        epoch_pbar.set_postfix(train=f"{train_loss:.4f}", val=f"{val_loss:.4f}", H=f"{score:.3f}", cls=f"{cls_acc:.3f}")
+        epoch_pbar.set_postfix(train=f"{train_loss:.4f}", val=f"{val_loss:.4f}", ACCIDENT=f"{acc:.3f}")
 
         print(
-            f"Epoch {epoch:02d}/{EPOCHS} | "
+            f"Epoch {epoch:02d}/{args.epochs} | "
             f"train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
-            f"T-acc={t_acc:.3f} | S-acc={s_acc:.3f} | Cls-acc={cls_acc:.3f} | H-score={score:.3f}"
+            f"T={t:.3f} | S={s:.3f} | C={c:.3f} | ACCIDENT={acc:.3f}"
         )
 
-        if score > best_score:
-            best_score = score
-            ckpt_path = os.path.join(SAVE_DIR, "best_model.pth")
+        if acc > best_score:
+            best_score = acc
+            ckpt_path = os.path.join(args.save_dir, "best_model.pth")
             torch.save(
                 {
                     "epoch": epoch,
@@ -330,10 +338,7 @@ def main():
                     "criterion_state": criterion.state_dict(),
                     "optimiser_state": optimiser.state_dict(),
                     "score": score,
-                    "args": {
-                        "hidden_size": HIDDEN_SIZE, "num_lstm_layers": NUM_LSTM_LAYERS,
-                        "dropout": DROPOUT, "num_frames": NUM_FRAMES,
-                    },
+                    "args": vars(args),
                 },
                 ckpt_path,
             )
@@ -343,4 +348,17 @@ def main():
 
 
 if __name__ == "__main__":
+    import sys
+    if len(sys.argv) == 1:
+        # ----------------------------------------------------------------
+        # IDE "Run" button — quick smoke-test config
+        # Change these values to adjust the quick run.
+        # ----------------------------------------------------------------
+        sys.argv += [
+            # "--max_samples", "500",
+            "--epochs",      "3",
+            "--batch_size",  "4",
+            "--num_workers", "0",   # 0 = no multiprocessing (required on Windows)
+            "--num_frames",  "8",   # fewer frames → faster per-sample loading
+        ]
     main()
